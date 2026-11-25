@@ -252,3 +252,216 @@ class CloseModal(discord.ui.Modal, title="🔒 Close Ticket & DM Transcript"):
 
     async def on_submit(self, i: discord.Interaction):
         await close_ticket(i, self.reason.value)
+
+# =====================================================================
+# PART 2 OF 2 — PASTE THIS DIRECTLY BELOW PART 1 (FAR LEFT EDGE)
+# =====================================================================
+class TicketControls(discord.ui.View):
+    """Persistent Claim, Escalate & Close buttons inside every ticket channel."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Claim Ticket", style=discord.ButtonStyle.success, emoji="🙋‍♂️", custom_id="ccf:claim")
+    async def b_claim(self, i: discord.Interaction, b: discord.ui.Button):
+        if not is_staff(i.user):
+            return await i.response.send_message("❌ Staff only.", ephemeral=True)
+        b.disabled, b.style, b.label = True, discord.ButtonStyle.secondary, f"Claimed by {i.user.display_name}"[:75]
+        emb = i.message.embeds[0] if i.message.embeds else None
+        if emb and len(emb.fields) > 1:
+            emb.set_field_at(1, name="🙋‍♂️ Claimed By", value=i.user.mention, inline=True)
+            await i.response.edit_message(embed=emb, view=self)
+        else:
+            await i.response.edit_message(view=self)
+        await i.channel.send(f"✅ {i.user.mention} has claimed this ticket and will assist you now!")
+
+    @discord.ui.button(label="Escalate (Urgent)", style=discord.ButtonStyle.primary, emoji="⬆️", custom_id="ccf:esc")
+    async def b_esc(self, i: discord.Interaction, b: discord.ui.Button):
+        if not is_staff(i.user):
+            return await i.response.send_message("❌ Staff only.", ephemeral=True)
+        b.disabled, b.label = True, "Escalated 🔴"
+        emb = i.message.embeds[0] if i.message.embeds else None
+        if emb:
+            emb.color = discord.Color.dark_red()
+            if len(emb.fields) > 2:
+                emb.set_field_at(2, name="🚦 Priority", value="🔴 `URGENT / ESCALATED`", inline=True)
+            await i.response.edit_message(embed=emb, view=self)
+        else:
+            await i.response.edit_message(view=self)
+        try:
+            if not i.channel.name.startswith("urgent-"):
+                await i.channel.edit(name=f"urgent-{i.channel.name}"[:90])
+        except Exception:
+            pass
+        hc_id = gcfg(i.guild.id).get("hc_role", 0)
+        ping = f"<@&{hc_id}>" if hc_id else "**High Command**"
+        await i.channel.send(f"🚨 {ping} — Ticket escalated to **URGENT** by {i.user.mention}!")
+
+    @discord.ui.button(label="Close & DM Transcript", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="ccf:close")
+    async def b_close(self, i: discord.Interaction, b: discord.ui.Button):
+        opener = f"UserID:{i.user.id}" in (i.channel.topic or "")
+        if not (is_staff(i.user) or opener):
+            return await i.response.send_message("❌ Only staff or the ticket opener can close this.", ephemeral=True)
+        await i.response.send_modal(CloseModal())
+
+
+class TicketPanel(discord.ui.View):
+    """6-Button Chicago Crossfire Support Center Panel."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="General Support", style=discord.ButtonStyle.primary, emoji="💬", custom_id="ccfp:sup", row=0)
+    async def b1(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(IntakeModal("support"))
+
+    @discord.ui.button(label="Report Player / Exploiter", style=discord.ButtonStyle.danger, emoji="🚨", custom_id="ccfp:rep", row=0)
+    async def b2(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(IntakeModal("report"))
+
+    @discord.ui.button(label="Ban / Mute Appeal", style=discord.ButtonStyle.secondary, emoji="⚖️", custom_id="ccfp:app", row=1)
+    async def b3(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(IntakeModal("appeal"))
+
+    @discord.ui.button(label="Bug & Glitch Report", style=discord.ButtonStyle.secondary, emoji="🐛", custom_id="ccfp:bug", row=1)
+    async def b4(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(IntakeModal("bug"))
+
+    @discord.ui.button(label="Gamepass / Shop Issue", style=discord.ButtonStyle.primary, emoji="💳", custom_id="ccfp:shp", row=2)
+    async def b5(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(IntakeModal("shop"))
+
+    @discord.ui.button(label="Faction / PD / Partner", style=discord.ButtonStyle.success, emoji="🤝", custom_id="ccfp:fac", row=2)
+    async def b6(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(IntakeModal("faction"))
+
+
+# --- 4. BOT CORE & SLASH COMMANDS ---
+class ChicagoBot(commands.Bot):
+    def __init__(self, mi: bool = True):
+        it = discord.Intents.default()
+        it.message_content = mi
+        super().__init__(command_prefix="!", intents=it, help_command=None)
+        self._synced = False
+
+    async def setup_hook(self):
+        self.add_view(TicketPanel())
+        self.add_view(TicketControls())
+        if not self._synced:
+            try:
+                await self.tree.sync()
+                self._synced = True
+            except Exception as e:
+                print(f"Sync notice: {e}")
+
+    async def on_ready(self):
+        global STATUS
+        STATUS = f"ONLINE as {self.user}"
+        print(f"✅ Chicago Crossfire Ticket Bot ONLINE as {self.user}")
+        try:
+            await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Chicago Crossfire Support 🎫"))
+        except Exception:
+            pass
+
+
+def reg_cmds(bot: ChicagoBot):
+    @bot.tree.command(name="ticket_setup", description="Set Staff Role, Ticket Category, Transcript Logs & optional High Command Role")
+    async def s_setup(i: discord.Interaction, staff_role: discord.Role, ticket_category: discord.CategoryChannel, transcript_log_channel: discord.TextChannel, high_command_role: discord.Role = None):
+        if not i.user.guild_permissions.administrator:
+            return await i.response.send_message("❌ Administrators only.", ephemeral=True)
+        CFG[str(i.guild.id)] = {
+            "staff_role": staff_role.id,
+            "hc_role": high_command_role.id if high_command_role else 0,
+            "cat_id": ticket_category.id,
+            "log_ch": transcript_log_channel.id,
+        }
+        save_cfg()
+        await i.response.send_message(
+            f"✅ **Chicago Crossfire Tickets Configured!**\n"
+            f"🛡️ Staff: {staff_role.mention} | 👑 Escalation Role: {high_command_role.mention if high_command_role else '*None*'}\n"
+            f"📁 Category: `{ticket_category.name}` | 📜 Logs: {transcript_log_channel.mention}\n"
+            f"👉 Next: Run **`/ticket_panel`** in your support channel!",
+            ephemeral=True,
+        )
+
+    @bot.tree.command(name="ticket_panel", description="Post the 6-button Chicago Crossfire Support & Ticket Panel")
+    async def s_panel(i: discord.Interaction):
+        if not is_staff(i.user):
+            return await i.response.send_message("❌ Staff only.", ephemeral=True)
+        emb = discord.Embed(
+            title="🔥 CHICAGO CROSSFIRE — SUPPORT & TICKET CENTER",
+            description=(
+                "Need help in **Chicago Crossfire**? Pick a category below to open a private ticket with our team!\n\n"
+                "💬 **General Support** — Questions & gameplay assistance\n"
+                "🚨 **Report Player / Exploiter** — Report cheaters, RDM, or rulebreakers\n"
+                "⚖️ **Ban / Mute Appeal** — Appeal an in-game or Discord punishment\n"
+                "🐛 **Bug & Glitch Report** — Report map glitches, weapon bugs, or crashes\n"
+                "💳 **Gamepass / Shop Issue** — Missing gamepasses or Roblox store issues\n"
+                "🤝 **Faction / PD / Partner** — Faction approvals, PD & partnerships\n\n"
+                "📄 *Every closed ticket automatically DMs you a full transcript!*"
+            ),
+            color=discord.Color.from_rgb(220, 53, 69),
+        )
+        emb.set_footer(text="Chicago Crossfire Support • Do not open troll tickets")
+        await i.response.send_message(embed=emb, view=TicketPanel())
+
+    @bot.tree.command(name="add_user", description="Add another player to this ticket")
+    async def s_add(i: discord.Interaction, member: discord.Member):
+        if not is_staff(i.user) or not (i.channel.topic or "").startswith("CCTicket |"):
+            return await i.response.send_message("❌ Staff inside a ticket channel only.", ephemeral=True)
+        await i.channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
+        await i.response.send_message(f"➕ Added {member.mention} to this ticket.")
+
+    @bot.tree.command(name="remove_user", description="Remove a player from this ticket")
+    async def s_rem(i: discord.Interaction, member: discord.Member):
+        if not is_staff(i.user) or not (i.channel.topic or "").startswith("CCTicket |"):
+            return await i.response.send_message("❌ Staff inside a ticket channel only.", ephemeral=True)
+        await i.channel.set_permissions(member, overwrite=None)
+        await i.response.send_message(f"➖ Removed {member.mention} from this ticket.")
+
+    @bot.tree.command(name="rename_ticket", description="Rename this ticket channel cleanly")
+    async def s_ren(i: discord.Interaction, new_name: str):
+        if not is_staff(i.user) or not (i.channel.topic or "").startswith("CCTicket |"):
+            return await i.response.send_message("❌ Staff inside a ticket channel only.", ephemeral=True)
+        clean = re.sub(r"[^a-z0-9-]", "-", new_name.lower().strip()).strip("-")[:60] or "ticket"
+        await i.channel.edit(name=clean)
+        await i.response.send_message(f"✏️ Renamed ticket channel to **`#{clean}`**.")
+
+    @bot.tree.command(name="close", description="Close this ticket and DM the full transcript to the player")
+    async def s_cls(i: discord.Interaction, reason: str = "Resolved by staff"):
+        if not is_staff(i.user):
+            return await i.response.send_message("❌ Staff only.", ephemeral=True)
+        await close_ticket(i, reason)
+
+
+# --- 5. 24/7 ENTRYPOINT WITH 429 AUTO-RETRY ---
+async def main():
+    global STATUS
+    await run_web()
+    asyncio.create_task(self_ping())
+    if not TOKEN:
+        STATUS = "MISSING BOT_TOKEN"
+        print("❌ Add BOT_TOKEN in Render Environment Variables!")
+        while True:
+            await asyncio.sleep(3600)
+    mi, w = True, 90
+    while True:
+        bot = ChicagoBot(mi)
+        reg_cmds(bot)
+        try:
+            await bot.start(TOKEN)
+            break
+        except discord.PrivilegedIntentsRequired:
+            await bot.close()
+            mi = False
+        except discord.HTTPException as e:
+            await bot.close()
+            if e.status == 429:
+                STATUS = f"429 wait {w}s"
+                await asyncio.sleep(w)
+                w = min(w + 60, 300)
+            else:
+                await asyncio.sleep(60)
+        except Exception as e:
+            await bot.close()
+            STATUS = f"Retry ({type(e).__name__})"
+            await asyncio.sleep(60)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    
