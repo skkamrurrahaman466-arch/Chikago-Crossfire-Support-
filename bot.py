@@ -727,3 +727,349 @@ class CloseModalV5(discord.ui.Modal, title="🔒 Close Ticket & DM Transcript"):
 
     async def on_submit(self, i: discord.Interaction):
         await close_ticket_interaction(i, self.reason.value)
+
+# =====================================================================
+# 5. PERSISTENT VIEWS (EXACT SAME PANEL BUTTONS + DEV TRACK CHOOSER)
+# =====================================================================
+class DevTrackChooserView(discord.ui.View):
+    """Separate application forms shown when clicking 'Development Application'."""
+
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label="In-Game Developer (Roblox)", style=discord.ButtonStyle.success, emoji="🎮", row=0)
+    async def b_game(self, i: discord.Interaction, b: discord.ui.Button):
+        await i.response.send_modal(InGameDevModal())
+
+    @discord.ui.button(label="Bot Developer (Discord/API)", style=discord.ButtonStyle.primary, emoji="🤖", row=0)
+    async def b_bot(self, i: discord.Interaction, b: discord.ui.Button):
+        await i.response.send_modal(BotDevModal())
+
+    @discord.ui.button(label="Creative / UI / GFX Dev", style=discord.ButtonStyle.secondary, emoji="🎨", row=0)
+    async def b_art(self, i: discord.Interaction, b: discord.ui.Button):
+        await i.response.send_modal(CreativeDevModal())
+
+
+class StaffToolsSelect(discord.ui.Select):
+    """Super-advanced Staff Tools dropdown neatly tucked below your familiar ticket buttons."""
+
+    def __init__(self, cid: str = "cct5:tools"):
+        opts = [
+            discord.SelectOption(label="🔐 Toggle Lock / Unlock Player Chat", value="lock"),
+            discord.SelectOption(label="🔒 Add Confidential Staff Note", value="add_note"),
+            discord.SelectOption(label="📋 View Confidential Staff Notes", value="view_notes"),
+            discord.SelectOption(label="🎙️ Spawn Private Voice / Interview Room", value="vc"),
+            discord.SelectOption(label="⏸️ Pause / Resume 24h Auto-Close", value="pause"),
+            discord.SelectOption(label="🔍 Live Roblox Account Lookup", value="rblx"),
+        ]
+        super().__init__(placeholder="⚙️ Staff: Advanced Ticket Tools...", options=opts, custom_id=cid, row=1)
+
+    async def callback(self, i: discord.Interaction):
+        if not is_staff(i.user):
+            return await i.response.send_message("❌ Staff only.", ephemeral=True)
+        act = self.values[0]
+        tinfo = gcfg(i.guild.id)["open_tickets"].setdefault(str(i.channel.id), {"locked": False, "pause_autoclose": False, "notes": []})
+
+        if act == "lock":
+            m = re.search(r"UserID:(\d+)", i.channel.topic or "")
+            opener = i.guild.get_member(int(m.group(1))) if m else None
+            tinfo["locked"] = not tinfo.get("locked", False)
+            save_db()
+            if opener:
+                try:
+                    await i.channel.set_permissions(opener, view_channel=True, send_messages=not tinfo["locked"], read_message_history=True)
+                except Exception:
+                    pass
+            return await i.response.send_message(f"{'🔒 Ticket **locked** (read-only for opener)' if tinfo['locked'] else '🔓 Ticket **unlocked**'} by {i.user.mention}.")
+        if act == "add_note":
+            return await i.response.send_modal(StaffNoteModal())
+        if act == "view_notes":
+            notes = tinfo.get("notes", [])
+            txt = "\n".join(f"• {n}" for n in notes) or "*No confidential staff notes on this ticket yet.*"
+            return await i.response.send_message(f"🔒 **Confidential Staff Notes (`#{i.channel.name}`):**\n{txt[:1800]}", ephemeral=True)
+        if act == "vc":
+            return await spawn_ticket_voice(i)
+        if act == "pause":
+            tinfo["pause_autoclose"] = not tinfo.get("pause_autoclose", False)
+            save_db()
+            return await i.response.send_message(f"{'⏸️ **24h Auto-Close PAUSED**' if tinfo['pause_autoclose'] else '▶️ **24h Auto-Close RESUMED**'} for this ticket.", ephemeral=True)
+        if act == "rblx":
+            return await i.response.send_modal(RobloxCheckModal())
+
+
+class MacroQuickSelect(discord.ui.Select):
+    def __init__(self):
+        opts = [
+            discord.SelectOption(label="🎥 Need 30s Video Proof", value="video_proof"),
+            discord.SelectOption(label="💳 Need Roblox Receipt", value="receipt"),
+            discord.SelectOption(label="🔗 Bloxlink Verify Fix", value="bloxlink"),
+            discord.SelectOption(label="⏳ Inactivity Reminder", value="inactivity"),
+            discord.SelectOption(label="🧪 Dev Test Rules", value="dev_test"),
+        ]
+        super().__init__(placeholder="⚡ Staff: Send Quick Macro Reply...", options=opts, custom_id="cct5:macro", row=2)
+
+    async def callback(self, i: discord.Interaction):
+        if not is_staff(i.user):
+            return await i.response.send_message("❌ Staff only.", ephemeral=True)
+        txt = gcfg(i.guild.id)["macros"].get(self.values[0], DEFAULT_MACROS.get(self.values[0], "Macro not found."))
+        await i.response.send_message(txt)
+
+
+class TicketControlsV5(discord.ui.View):
+    """Exact same 3 main buttons as V2 (Claim, Escalate, Close) + Staff Tools & Quick Macros below."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(StaffToolsSelect("cct5:tools"))
+        self.add_item(MacroQuickSelect())
+
+    @discord.ui.button(label="Claim Ticket", style=discord.ButtonStyle.success, emoji="🙋‍♂️", custom_id="cct5:claim", row=0)
+    async def b_claim(self, i: discord.Interaction, b: discord.ui.Button):
+        if not is_staff(i.user):
+            return await i.response.send_message("❌ Staff only.", ephemeral=True)
+        b.disabled, b.style, b.label = True, discord.ButtonStyle.secondary, f"Claimed by {i.user.display_name}"[:75]
+        tinfo = gcfg(i.guild.id)["open_tickets"].get(str(i.channel.id))
+        if tinfo and not tinfo.get("claimer_id"):
+            tinfo["claimer_id"] = i.user.id
+            st = get_staff_stat(i.guild.id, i.user.id)
+            st["claimed"] += 1
+            st["resp_sum"] += max(1.0, time.time() - tinfo.get("created_at", time.time()))
+            st["resp_cnt"] += 1
+            save_db()
+        emb = i.message.embeds[0] if i.message.embeds else None
+        if emb and len(emb.fields) > 1:
+            emb.set_field_at(1, name="🙋‍♂️ Claimed By", value=i.user.mention, inline=True)
+            await i.response.edit_message(embed=emb, view=self)
+        else:
+            await i.response.edit_message(view=self)
+        await i.channel.send(f"✅ {i.user.mention} has claimed this ticket and will assist you now!")
+
+    @discord.ui.button(label="Escalate (Urgent)", style=discord.ButtonStyle.primary, emoji="⬆️", custom_id="cct5:esc", row=0)
+    async def b_esc(self, i: discord.Interaction, b: discord.ui.Button):
+        if not is_staff(i.user):
+            return await i.response.send_message("❌ Staff only.", ephemeral=True)
+        b.disabled, b.label = True, "Escalated 🔴"
+        emb = i.message.embeds[0] if i.message.embeds else None
+        if emb:
+            emb.color = discord.Color.dark_red()
+            if len(emb.fields) > 2:
+                emb.set_field_at(2, name="🚦 Priority", value="🔴 `URGENT / ESCALATED`", inline=True)
+            await i.response.edit_message(embed=emb, view=self)
+        else:
+            await i.response.edit_message(view=self)
+        try:
+            if not i.channel.name.startswith("urgent-"):
+                await i.channel.edit(name=f"urgent-{i.channel.name}"[:90])
+        except Exception:
+            pass
+        hc_id = gcfg(i.guild.id).get("hc_role", 0)
+        ping = f"<@&{hc_id}>" if hc_id else "**High Command**"
+        await i.channel.send(f"🚨 {ping} — Ticket escalated to **URGENT** by {i.user.mention}!")
+
+    @discord.ui.button(label="Close & DM Transcript", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="cct5:close", row=0)
+    async def b_close(self, i: discord.Interaction, b: discord.ui.Button):
+        if not (is_staff(i.user) or f"UserID:{i.user.id}" in (i.channel.topic or "")):
+            return await i.response.send_message("❌ Only staff or the ticket opener can close this.", ephemeral=True)
+        await i.response.send_modal(CloseModalV5())
+
+
+class DevReviewControlsV5(discord.ui.View):
+    """Executive controls inside Development Applications."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(StaffToolsSelect("ccdv5:tools"))
+
+    def _opener_and_track(self, ch: discord.TextChannel):
+        t = ch.topic or ""
+        um, tm = re.search(r"UserID:(\d+)", t), re.search(r"Type:([a-z0-9_]+)", t)
+        return (int(um.group(1)) if um else None), (tm.group(1) if tm else "dev_ingame")
+
+    @discord.ui.button(label="Claim Review", style=discord.ButtonStyle.primary, emoji="🙋‍♂️", custom_id="ccdv5:claim", row=0)
+    async def b_claim(self, i: discord.Interaction, b: discord.ui.Button):
+        if not is_dev_reviewer(i.user):
+            return await i.response.send_message("❌ Dev Lead / High Command only.", ephemeral=True)
+        b.disabled, b.style, b.label = True, discord.ButtonStyle.secondary, f"Reviewer: {i.user.display_name}"[:75]
+        tinfo = gcfg(i.guild.id)["open_tickets"].get(str(i.channel.id))
+        if tinfo:
+            tinfo["claimer_id"] = i.user.id
+            save_db()
+        emb = i.message.embeds[0] if i.message.embeds else None
+        if emb and len(emb.fields) > 1:
+            emb.set_field_at(1, name="🙋‍♂️ Reviewer", value=i.user.mention, inline=True)
+            await i.response.edit_message(embed=emb, view=self)
+        else:
+            await i.response.edit_message(view=self)
+        await i.channel.send(f"👀 {i.user.mention} is now reviewing this Development Application!")
+
+    @discord.ui.button(label="Assign Test Task", style=discord.ButtonStyle.secondary, emoji="🧪", custom_id="ccdv5:test", row=0)
+    async def b_test(self, i: discord.Interaction, b: discord.ui.Button):
+        if not is_dev_reviewer(i.user):
+            return await i.response.send_message("❌ Dev Lead / High Command only.", ephemeral=True)
+        await i.response.send_modal(DevTestTaskModal())
+
+    @discord.ui.button(label="Score (1-10)", style=discord.ButtonStyle.secondary, emoji="📊", custom_id="ccdv5:score", row=0)
+    async def b_score(self, i: discord.Interaction, b: discord.ui.Button):
+        if not is_dev_reviewer(i.user):
+            return await i.response.send_message("❌ Dev Lead / High Command only.", ephemeral=True)
+        await i.response.send_modal(DevScoreModal())
+
+    @discord.ui.button(label="Accept & Auto-Role", style=discord.ButtonStyle.success, emoji="✅", custom_id="ccdv5:acc", row=2)
+    async def b_acc(self, i: discord.Interaction, b: discord.ui.Button):
+        if not is_dev_reviewer(i.user):
+            return await i.response.send_message("❌ Dev Lead / High Command only.", ephemeral=True)
+        uid, track = self._opener_and_track(i.channel)
+        c = gcfg(i.guild.id)
+        role_id = c["bot_dev_role"] if track == "dev_bot" else c["ingame_dev_role"]
+        role = i.guild.get_role(role_id) if role_id else None
+        mem = i.guild.get_member(uid) if uid else None
+        role_msg = ""
+        if role and mem:
+            try:
+                await mem.add_roles(role, reason=f"Development Application Accepted by {i.user}")
+                role_msg = f"\n🎖️ Auto-assigned role: {role.mention}"
+            except Exception:
+                role_msg = "\n⚠️ *(Move Bot Role higher to auto-assign Dev role)*"
+        emb = i.message.embeds[0] if i.message.embeds else None
+        if emb and len(emb.fields) > 0:
+            emb.color = discord.Color.brand_green()
+            emb.set_field_at(0, name="📊 Stage", value="🟢 `ACCEPTED`", inline=True)
+            await i.response.edit_message(embed=emb, view=self)
+        else:
+            await i.response.edit_message(view=self)
+        await i.channel.send(f"🎉 **CONGRATULATIONS {f'<@{uid}>' if uid else 'Applicant'}!** Accepted by {i.user.mention}!{role_msg}")
+        if mem:
+            try:
+                await mem.send(f"🎉 **{i.guild.name} — Development Application ACCEPTED!** Reviewed by {i.user.display_name}. Check `#{i.channel.name}`!")
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, emoji="❌", custom_id="ccdv5:dec", row=2)
+    async def b_dec(self, i: discord.Interaction, b: discord.ui.Button):
+        if not is_dev_reviewer(i.user):
+            return await i.response.send_message("❌ Dev Lead / High Command only.", ephemeral=True)
+        await i.response.send_modal(DeclineDevModal())
+
+    @discord.ui.button(label="Close & DM Transcript", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="ccdv5:cls", row=2)
+    async def b_cls(self, i: discord.Interaction, b: discord.ui.Button):
+        if not (is_dev_reviewer(i.user) or f"UserID:{i.user.id}" in (i.channel.topic or "")):
+            return await i.response.send_message("❌ Dev Reviewer or applicant only.", ephemeral=True)
+        await i.response.send_modal(CloseModalV5())
+
+
+class InactivityNudgeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Still Need Help", style=discord.ButtonStyle.success, emoji="✅", custom_id="cct5:keep")
+    async def b_keep(self, i: discord.Interaction, b: discord.ui.Button):
+        tinfo = gcfg(i.guild.id)["open_tickets"].get(str(i.channel.id))
+        if tinfo:
+            tinfo["last_msg"] = time.time()
+            tinfo["nudged"] = False
+            tinfo["nudged_at"] = 0.0
+            save_db()
+        await i.response.edit_message(content=f"✅ {i.user.mention} confirmed this ticket is still active!", view=None)
+
+    @discord.ui.button(label="Close Ticket Now", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="cct5:nclose")
+    async def b_nclose(self, i: discord.Interaction, b: discord.ui.Button):
+        await close_ticket_interaction(i, "Closed by user after inactivity check")
+
+
+class StarRatingView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _rate(self, i: discord.Interaction, stars: int):
+        emb = i.message.embeds[0] if i.message.embeds else None
+        ft = (emb.footer.text if emb and emb.footer else "") or ""
+        gm, sm, tm = re.search(r"GuildID:(\d+)", ft), re.search(r"StaffID:(\d+)", ft), re.search(r"Ticket:([^\s|]+)", ft)
+        gid, sid, tname = (int(gm.group(1)) if gm else 0), (int(sm.group(1)) if sm else 0), (tm.group(1) if tm else "ticket")
+        if gid and sid:
+            st = get_staff_stat(gid, sid)
+            st["stars_sum"] += stars
+            st["stars_cnt"] += 1
+            save_db()
+            g = i.client.get_guild(gid)
+            if g and g.get_channel(gcfg(gid)["log_ch"]):
+                avg = round(st["stars_sum"] / st["stars_cnt"], 2)
+                try:
+                    await g.get_channel(gcfg(gid)["log_ch"]).send(
+                        embed=discord.Embed(
+                            title=f"⭐ Ticket Rating — {'⭐' * stars} ({stars}/5)",
+                            description=f"🎫 **Ticket:** `#{tname}` • 👤 **By:** {i.user.mention}\n🛡️ **Staff:** <@{sid}> *(Lifetime Avg: **`{avg}/5`**)*",
+                            color=discord.Color.gold(),
+                            timestamp=discord.utils.utcnow(),
+                        )
+                    )
+                except Exception:
+                    pass
+        for item in self.children:
+            item.disabled = True
+        await i.response.edit_message(view=self)
+        await i.followup.send(f"🙏 Thank you for rating our support **{'⭐' * stars} ({stars}/5)**!", ephemeral=True)
+
+    @discord.ui.button(label="1⭐", style=discord.ButtonStyle.secondary, custom_id="v5r:1")
+    async def r1(self, i: discord.Interaction, b: discord.ui.Button): await self._rate(i, 1)
+
+    @discord.ui.button(label="2⭐", style=discord.ButtonStyle.secondary, custom_id="v5r:2")
+    async def r2(self, i: discord.Interaction, b: discord.ui.Button): await self._rate(i, 2)
+
+    @discord.ui.button(label="3⭐", style=discord.ButtonStyle.secondary, custom_id="v5r:3")
+    async def r3(self, i: discord.Interaction, b: discord.ui.Button): await self._rate(i, 3)
+
+    @discord.ui.button(label="4⭐", style=discord.ButtonStyle.primary, custom_id="v5r:4")
+    async def r4(self, i: discord.Interaction, b: discord.ui.Button): await self._rate(i, 4)
+
+    @discord.ui.button(label="5⭐", style=discord.ButtonStyle.success, custom_id="v5r:5")
+    async def r5(self, i: discord.Interaction, b: discord.ui.Button): await self._rate(i, 5)
+
+
+class TicketPanelV5(discord.ui.View):
+    """Exact same 6 original buttons + Row 3 'Development Application' button."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="General Support", style=discord.ButtonStyle.primary, emoji="💬", custom_id="v5p:sup", row=0)
+    async def b1(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(StandardTicketModal("support"))
+
+    @discord.ui.button(label="Report Player / Exploiter", style=discord.ButtonStyle.danger, emoji="🚨", custom_id="v5p:rep", row=0)
+    async def b2(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(StandardTicketModal("report"))
+
+    @discord.ui.button(label="Ban / Mute Appeal", style=discord.ButtonStyle.secondary, emoji="⚖️", custom_id="v5p:app", row=1)
+    async def b3(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(StandardTicketModal("appeal"))
+
+    @discord.ui.button(label="Bug & Glitch Report", style=discord.ButtonStyle.secondary, emoji="🐛", custom_id="v5p:bug", row=1)
+    async def b4(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(StandardTicketModal("bug"))
+
+    @discord.ui.button(label="Gamepass / Shop Issue", style=discord.ButtonStyle.primary, emoji="💳", custom_id="v5p:shp", row=2)
+    async def b5(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(StandardTicketModal("shop"))
+
+    @discord.ui.button(label="Faction / PD / Partner", style=discord.ButtonStyle.success, emoji="🤝", custom_id="v5p:fac", row=2)
+    async def b6(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(StandardTicketModal("faction"))
+
+    @discord.ui.button(label="Development Application", style=discord.ButtonStyle.success, emoji="🛠️", custom_id="v5p:dev", row=3)
+    async def b7(self, i: discord.Interaction, b: discord.ui.Button):
+        await i.response.send_message(
+            "🛠️ **Select Your Development Application Track:**\n"
+            "• **🎮 In-Game Developer (Roblox):** Luau Scripters, Builders, 3D Modelers, Animators, VFX\n"
+            "• **🤖 Bot Developer (Discord/API):** Python/Node.js Bots, APIs, Security, 24/7 Hosting\n"
+            "• **🎨 Creative / UI / GFX Dev:** UI/UX, 3D GFX, Police/Gang Uniforms, Video Editing",
+            view=DevTrackChooserView(),
+            ephemeral=True,
+        )
+
+
+class DedicatedDevPanelV5(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="In-Game Developer", style=discord.ButtonStyle.success, emoji="🎮", custom_id="v5dp:game")
+    async def b_g(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(InGameDevModal())
+
+    @discord.ui.button(label="Bot Developer", style=discord.ButtonStyle.primary, emoji="🤖", custom_id="v5dp:bot")
+    async def b_b(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(BotDevModal())
+
+    @discord.ui.button(label="Creative / UI / GFX", style=discord.ButtonStyle.secondary, emoji="🎨", custom_id="v5dp:art")
+    async def b_a(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(CreativeDevModal())
