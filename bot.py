@@ -1073,3 +1073,349 @@ class DedicatedDevPanelV5(discord.ui.View):
 
     @discord.ui.button(label="Creative / UI / GFX", style=discord.ButtonStyle.secondary, emoji="🎨", custom_id="v5dp:art")
     async def b_a(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(CreativeDevModal())
+
+# =====================================================================
+# 6. BOT CORE, SLA + 24H AUTO-CLOSE WATCHDOG & SLASH COMMANDS
+# =====================================================================
+class TicketBotV5(commands.Bot):
+    def __init__(self, mi: bool = True):
+        it = discord.Intents.default()
+        it.message_content = mi
+        super().__init__(command_prefix="!", intents=it, help_command=None)
+        self._synced = False
+
+    async def setup_hook(self):
+        for v in (TicketPanelV5(), DedicatedDevPanelV5(), TicketControlsV5(), DevReviewControlsV5(), InactivityNudgeView(), StarRatingView()):
+            self.add_view(v)
+        if not self._synced:
+            try:
+                await self.tree.sync()
+                self._synced = True
+            except Exception as e:
+                print(f"Sync notice: {e}")
+
+    async def on_ready(self):
+        global BOT_STATUS
+        BOT_STATUS = f"ONLINE as {self.user}"
+        print(f"✅ Chicago Crossfire Ticket Bot V5 ONLINE as {self.user}")
+        if not self.watchdog.is_running():
+            self.watchdog.start()
+        try:
+            await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Chicago Crossfire V5 Tickets 🔥"))
+        except Exception:
+            pass
+
+    async def on_message(self, msg: discord.Message):
+        if msg.author.bot or not msg.guild:
+            return
+        await self.process_commands(msg)
+        tinfo = gcfg(msg.guild.id)["open_tickets"].get(str(msg.channel.id))
+        if tinfo:
+            tinfo["last_msg"] = time.time()
+            tinfo["nudged"] = False
+            tinfo["nudged_at"] = 0.0
+
+    @tasks.loop(minutes=5)
+    async def watchdog(self):
+        """Monitors SLA unclaimed times, sends 12h inactivity nudges, and auto-closes at 24h if unpaused."""
+        now = time.time()
+        changed = False
+        for gid_str, c in list(DB.items()):
+            g = self.get_guild(int(gid_str))
+            if not g:
+                continue
+            sla_sec = max(5, int(c.get("sla_mins", 15))) * 60
+            inact_sec = max(1, int(c.get("inactive_hrs", 12))) * 3600
+            for cid_str, tinfo in list(c.get("open_tickets", {}).items()):
+                ch = g.get_channel(int(cid_str))
+                if not ch:
+                    c["open_tickets"].pop(cid_str, None)
+                    changed = True
+                    continue
+
+                if not tinfo.get("claimer_id") and not tinfo.get("sla_alerted") and (now - tinfo.get("created_at", now)) >= sla_sec:
+                    tinfo["sla_alerted"] = True
+                    changed = True
+                    ping = f"<@&{c['hc_role']}>" if c.get("hc_role") else (f"<@&{c['staff_role']}>" if c.get("staff_role") else "**Staff**")
+                    try:
+                        await ch.send(f"⏰ **SLA ALERT ({c.get('sla_mins', 15)}m Unclaimed):** {ping} — Please claim and assist this ticket!")
+                    except Exception:
+                        pass
+
+                if tinfo.get("pause_autoclose"):
+                    continue
+
+                if not tinfo.get("nudged") and (now - tinfo.get("last_msg", now)) >= inact_sec:
+                    tinfo["nudged"] = True
+                    tinfo["nudged_at"] = now
+                    changed = True
+                    uid = tinfo.get("opener_id")
+                    try:
+                        await ch.send(
+                            f"⏳ **Inactivity Reminder:** {f'<@{uid}>' if uid else 'Member'}, do you still need help? This ticket will auto-close in **12 hours** if inactive.",
+                            view=InactivityNudgeView(),
+                        )
+                    except Exception:
+                        pass
+                elif tinfo.get("nudged") and tinfo.get("nudged_at") and (now - tinfo["nudged_at"]) >= inact_sec:
+                    changed = True
+                    asyncio.create_task(finalize_close_ticket(self, ch, self.user, "Auto-closed after 24h of inactivity"))
+        if changed:
+            save_db()
+
+
+def reg_cmds(bot: TicketBotV5):
+    @bot.tree.command(name="ticket_setup", description="Full V5 setup: Staff, High Command, Dev Lead, Dev Auto-Roles, Categories & Logs")
+    async def s_setup(
+        i: discord.Interaction,
+        staff_role: discord.Role,
+        ticket_category: discord.CategoryChannel,
+        transcript_log_channel: discord.TextChannel,
+        high_command_role: discord.Role = None,
+        dev_lead_role: discord.Role = None,
+        dev_app_category: discord.CategoryChannel = None,
+        ingame_dev_role: discord.Role = None,
+        bot_dev_role: discord.Role = None,
+        sla_minutes: int = 15,
+        max_open_per_user: int = 2,
+    ):
+        if not i.user.guild_permissions.administrator:
+            return await i.response.send_message("❌ Administrators only.", ephemeral=True)
+        c = gcfg(i.guild.id)
+        c.update({
+            "staff_role": staff_role.id,
+            "hc_role": high_command_role.id if high_command_role else 0,
+            "dev_lead_role": dev_lead_role.id if dev_lead_role else 0,
+            "ingame_dev_role": ingame_dev_role.id if ingame_dev_role else 0,
+            "bot_dev_role": bot_dev_role.id if bot_dev_role else 0,
+            "cat_id": ticket_category.id,
+            "dev_cat_id": dev_app_category.id if dev_app_category else ticket_category.id,
+            "log_ch": transcript_log_channel.id,
+            "sla_mins": max(5, sla_minutes),
+            "max_open": max(1, min(max_open_per_user, 5)),
+        })
+        save_db()
+        await i.response.send_message(
+            f"✅ **Chicago Crossfire Tickets V5 Ready!**\n"
+            f"🛡️ Staff: {staff_role.mention} | 👑 HC: {high_command_role.mention if high_command_role else '*None*'} | 🛠️ Dev Lead: {dev_lead_role.mention if dev_lead_role else '*None*'}\n"
+            f"🎖️ Dev Roles: In-Game={ingame_dev_role.mention if ingame_dev_role else '*None*'} | Bot={bot_dev_role.mention if bot_dev_role else '*None*'}\n"
+            f"📁 Support Cat: `{ticket_category.name}` | 📜 Logs: {transcript_log_channel.mention} | ⏱️ SLA: `{c['sla_mins']}m`\n"
+            f"👉 Run **`/ticket_panel`** (and optional **`/dev_app_panel`**)!",
+            ephemeral=True,
+        )
+
+    @bot.tree.command(name="ticket_panel", description="Post the Chicago Crossfire V5 Support & Development Application Panel")
+    async def s_panel(i: discord.Interaction):
+        if not is_staff(i.user):
+            return await i.response.send_message("❌ Staff only.", ephemeral=True)
+        n_on = len(gcfg(i.guild.id)["oncall"])
+        emb = discord.Embed(
+            title="🔥 CHICAGO CROSSFIRE — SUPPORT & TICKET CENTER",
+            description=(
+                "Need help in **Chicago Crossfire**? Pick a category below to open a private ticket with our team!\n\n"
+                "💬 **General Support** — Questions & gameplay assistance\n"
+                "🚨 **Report Player / Exploiter** — Report cheaters, RDM, or rulebreakers\n"
+                "⚖️ **Ban / Mute Appeal** — Appeal an in-game or Discord punishment\n"
+                "🐛 **Bug & Glitch Report** — Report map glitches, weapon bugs, or crashes\n"
+                "💳 **Gamepass / Shop Issue** — Missing gamepasses or Roblox store issues\n"
+                "🤝 **Faction / PD / Partner** — Faction approvals, PD & partnerships\n"
+                "🛠️ **Development Application** — Separate forms for **In-Game Dev**, **Bot Dev** & **Creative/UI**\n\n"
+                f"🟢 **Agents On-Call:** `{n_on}` • ⏱️ **Est. Wait:** `{get_avg_wait_text(i.guild.id)}`\n"
+                "📄 *Every closed ticket DMs you styled HTML + TXT transcripts!*"
+            ),
+            color=discord.Color.from_rgb(220, 53, 69),
+        )
+        emb.set_footer(text="Chicago Crossfire Support V5 • Live Roblox Verification Enabled")
+        await i.response.send_message(embed=emb, view=TicketPanelV5())
+
+    @bot.tree.command(name="dev_app_panel", description="Post a standalone 3-button Development Applications panel")
+    async def s_devp(i: discord.Interaction):
+        if not is_dev_reviewer(i.user):
+            return await i.response.send_message("❌ Dev Lead / High Command only.", ephemeral=True)
+        emb = discord.Embed(
+            title="🛠️ CHICAGO CROSSFIRE — DEVELOPMENT APPLICATIONS",
+            description=(
+                "Pick your exact development track below:\n\n"
+                "🎮 **In-Game Developer** — Luau Scripters, Builders, 3D Modelers, Animators, VFX\n"
+                "🤖 **Bot Developer** — Python/Node.js Bots, APIs, Webhooks, Security, 24/7 Hosting\n"
+                "🎨 **Creative / UI / GFX** — UI/UX Designers, 3D GFX, Uniforms, Video Editors"
+            ),
+            color=discord.Color.teal(),
+        )
+        await i.response.send_message(embed=emb, view=DedicatedDevPanelV5())
+
+    @bot.tree.command(name="ticket_dashboard", description="Live executive dashboard of open tickets, queue, SLA & On-Call staff")
+    async def s_dash(i: discord.Interaction):
+        if not is_staff(i.user):
+            return await i.response.send_message("❌ Staff only.", ephemeral=True)
+        c = gcfg(i.guild.id)
+        opens = c["open_tickets"]
+        unclaimed = sum(1 for t in opens.values() if not t.get("claimer_id"))
+        dev_apps = sum(1 for t in opens.values() if str(t.get("type", "")).startswith("dev_"))
+        oc_str = ", ".join(f"<@{u}>" for u in c["oncall"]) or "*None*"
+        emb = discord.Embed(title="📊 Ticket V5 Live Operations Dashboard", color=discord.Color.blurple(), timestamp=discord.utils.utcnow())
+        emb.add_field(name="🎫 Open Tickets", value=f"`{len(opens)}` total (`{unclaimed}` unclaimed)", inline=True)
+        emb.add_field(name="🛠️ Open Dev Apps", value=f"`{dev_apps}`", inline=True)
+        emb.add_field(name="⏱️ Avg Wait Time", value=f"`{get_avg_wait_text(i.guild.id)}`", inline=True)
+        emb.add_field(name="🟢 On-Call Staff", value=oc_str[:900], inline=False)
+        emb.add_field(name="📈 All-Time Counter", value=f"`#{c['counter']}` tickets opened • `{len(c['blacklist'])}` blacklisted", inline=False)
+        await i.response.send_message(embed=emb, ephemeral=True)
+
+    @bot.tree.command(name="oncall", description="Toggle yourself On-Call / Off-Call for live ticket pings")
+    async def s_oc(i: discord.Interaction):
+        if not is_staff(i.user):
+            return await i.response.send_message("❌ Staff only.", ephemeral=True)
+        oc = gcfg(i.guild.id)["oncall"]
+        if i.user.id in oc:
+            oc.remove(i.user.id)
+            msg = f"🔴 {i.user.mention} is now **OFF-CALL**."
+        else:
+            oc.append(i.user.id)
+            msg = f"🟢 {i.user.mention} is now **ON-CALL** for live ticket pings!"
+        save_db()
+        await i.response.send_message(msg)
+
+    @bot.tree.command(name="note", description="Add a confidential staff-only note to this ticket (hidden from player)")
+    async def s_note(i: discord.Interaction, text: str):
+        if not is_staff(i.user) or not (i.channel.topic or "").startswith("CCT5 |"):
+            return await i.response.send_message("❌ Staff inside a V5 ticket only.", ephemeral=True)
+        tinfo = gcfg(i.guild.id)["open_tickets"].setdefault(str(i.channel.id), {"notes": []})
+        tinfo.setdefault("notes", []).append(f"[{i.user.display_name}] {text[:450]}")
+        save_db()
+        await i.response.send_message("🔒 **Private Staff Note Saved** *(archived ONLY in Staff Logs)*.", ephemeral=True)
+
+    @bot.tree.command(name="transfer", description="Transfer ownership of this ticket to another staff member or developer")
+    async def s_trans(i: discord.Interaction, staff_member: discord.Member):
+        if not is_staff(i.user) or not (i.channel.topic or "").startswith("CCT5 |"):
+            return await i.response.send_message("❌ Staff inside a V5 ticket only.", ephemeral=True)
+        tinfo = gcfg(i.guild.id)["open_tickets"].setdefault(str(i.channel.id), {})
+        tinfo["claimer_id"] = staff_member.id
+        save_db()
+        await i.channel.set_permissions(staff_member, view_channel=True, send_messages=True, read_message_history=True)
+        await i.response.send_message(f"🔁 Ticket transferred from {i.user.mention} ➔ {staff_member.mention}!")
+
+    @bot.tree.command(name="ticket_vc", description="Spawn a temporary private voice room for this ticket / dev interview")
+    async def s_vc(i: discord.Interaction):
+        if not is_staff(i.user) or not (i.channel.topic or "").startswith("CCT5 |"):
+            return await i.response.send_message("❌ Staff inside a V5 ticket only.", ephemeral=True)
+        await spawn_ticket_voice(i)
+
+    @bot.tree.command(name="check_roblox", description="Verify any Roblox username live (ID, Account Age & Ban Status)")
+    async def s_rblx(i: discord.Interaction, username: str):
+        await i.response.defer(ephemeral=True)
+        await i.followup.send(f"🔍 **Roblox Lookup:** {await lookup_roblox_user(username)}", ephemeral=True)
+
+    @bot.tree.command(name="add_macro", description="Create or update a canned staff reply macro")
+    async def s_am(i: discord.Interaction, name: str, text: str):
+        if not is_staff(i.user):
+            return await i.response.send_message("❌ Staff only.", ephemeral=True)
+        key = re.sub(r"[^a-z0-9_]", "", name.lower().strip())[:25]
+        gcfg(i.guild.id)["macros"][key] = text[:1200]
+        save_db()
+        await i.response.send_message(f"⚡ Saved macro **`{key}`**! Use `/macro {key}` inside any ticket.", ephemeral=True)
+
+    @bot.tree.command(name="macro", description="Send a saved canned staff reply macro")
+    async def s_m(i: discord.Interaction, name: str):
+        if not is_staff(i.user):
+            return await i.response.send_message("❌ Staff only.", ephemeral=True)
+        macros = gcfg(i.guild.id)["macros"]
+        txt = macros.get(name.lower().strip())
+        if not txt:
+            return await i.response.send_message(f"❌ Not found. Available: {', '.join(f'`{k}`' for k in macros)}", ephemeral=True)
+        await i.response.send_message(txt)
+
+    @bot.tree.command(name="staff_stats", description="View a staff member's claims, closes, speed & 5-star rating")
+    async def s_stats(i: discord.Interaction, member: discord.Member = None):
+        target = member or i.user
+        st = get_staff_stat(i.guild.id, target.id)
+        avg_r = f"`{int(st['resp_sum'] / st['resp_cnt'])}s`" if st["resp_cnt"] else "*N/A*"
+        avg_s = f"**`{round(st['stars_sum'] / st['stars_cnt'], 2)} / 5⭐`** (`{st['stars_cnt']}` ratings)" if st["stars_cnt"] else "*No ratings yet*"
+        emb = discord.Embed(title=f"📊 Staff Support Analytics — {target.display_name}", color=discord.Color.blurple())
+        emb.set_thumbnail(url=target.display_avatar.url)
+        emb.add_field(name="🙋‍♂️ Claimed", value=f"`{st['claimed']}`", inline=True)
+        emb.add_field(name="🔒 Closed", value=f"`{st['closed']}`", inline=True)
+        emb.add_field(name="⚡ Avg Response", value=avg_r, inline=True)
+        emb.add_field(name="⭐ Player Satisfaction", value=avg_s, inline=False)
+        await i.response.send_message(embed=emb, ephemeral=True)
+
+    @bot.tree.command(name="ticket_leaderboard", description="Top Support Staff leaderboard by tickets closed & rating")
+    async def s_lb(i: discord.Interaction):
+        ranked = sorted(gcfg(i.guild.id)["staff_stats"].items(), key=lambda kv: (kv[1]["closed"], kv[1]["claimed"]), reverse=True)[:10]
+        if not ranked:
+            return await i.response.send_message("📊 No ticket stats recorded yet!", ephemeral=True)
+        lines = [f"**#{idx}** <@{uid}> — `{st['closed']}` closed • `{st['claimed']}` claimed • `{round(st['stars_sum']/st['stars_cnt'], 1)}⭐`" if st["stars_cnt"] else f"**#{idx}** <@{uid}> — `{st['closed']}` closed • `{st['claimed']}` claimed" for idx, (uid, st) in enumerate(ranked, 1)]
+        await i.response.send_message(embed=discord.Embed(title="🏆 Top Support Staff Leaderboard", description="\n".join(lines), color=discord.Color.gold()))
+
+    @bot.tree.command(name="ticket_blacklist", description="Block a troll/spammer from opening tickets")
+    async def s_bl(i: discord.Interaction, member: discord.Member, reason: str = "Troll / Spam Tickets"):
+        if not is_staff(i.user):
+            return await i.response.send_message("❌ Staff only.", ephemeral=True)
+        gcfg(i.guild.id)["blacklist"][str(member.id)] = reason[:200]
+        save_db()
+        await i.response.send_message(f"🚫 Blacklisted {member.mention} (`{reason}`).", ephemeral=True)
+
+    @bot.tree.command(name="ticket_unblacklist", description="Remove a member from the ticket blacklist")
+    async def s_ubl(i: discord.Interaction, member: discord.Member):
+        if not is_staff(i.user):
+            return await i.response.send_message("❌ Staff only.", ephemeral=True)
+        gcfg(i.guild.id)["blacklist"].pop(str(member.id), None)
+        save_db()
+        await i.response.send_message(f"✅ Unblacklisted {member.mention}.", ephemeral=True)
+
+    @bot.tree.command(name="add_user", description="Add another member to this ticket")
+    async def s_add(i: discord.Interaction, member: discord.Member):
+        if not is_staff(i.user) or not (i.channel.topic or "").startswith("CCT5 |"):
+            return await i.response.send_message("❌ Staff inside a V5 ticket only.", ephemeral=True)
+        await i.channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
+        await i.response.send_message(f"➕ Added {member.mention} to this ticket.")
+
+    @bot.tree.command(name="remove_user", description="Remove a member from this ticket")
+    async def s_rem(i: discord.Interaction, member: discord.Member):
+        if not is_staff(i.user) or not (i.channel.topic or "").startswith("CCT5 |"):
+            return await i.response.send_message("❌ Staff inside a V5 ticket only.", ephemeral=True)
+        await i.channel.set_permissions(member, overwrite=None)
+        await i.response.send_message(f"➖ Removed {member.mention} from this ticket.")
+
+    @bot.tree.command(name="rename_ticket", description="Rename this ticket channel")
+    async def s_ren(i: discord.Interaction, new_name: str):
+        if not is_staff(i.user) or not (i.channel.topic or "").startswith("CCT5 |"):
+            return await i.response.send_message("❌ Staff inside a V5 ticket only.", ephemeral=True)
+        clean = re.sub(r"[^a-z0-9-]", "-", new_name.lower().strip()).strip("-")[:60] or "ticket"
+        await i.channel.edit(name=clean)
+        await i.response.send_message(f"✏️ Renamed ticket to **`#{clean}`**.")
+
+    @bot.tree.command(name="close", description="Close this ticket, send HTML+TXT transcripts & 5-star rating DM")
+    async def s_cls(i: discord.Interaction, reason: str = "Resolved by staff"):
+        if not is_staff(i.user):
+            return await i.response.send_message("❌ Staff only.", ephemeral=True)
+        await close_ticket_interaction(i, reason)
+
+
+# =====================================================================
+# 7. MAIN ENTRYPOINT (24/7 + 429 AUTO-RETRY)
+# =====================================================================
+async def main():
+    global BOT_STATUS
+    await run_web()
+    asyncio.create_task(self_ping())
+    if not TOKEN:
+        BOT_STATUS = "MISSING BOT_TOKEN"
+        print("❌ ERROR: Add BOT_TOKEN in Environment Variables!")
+        while True:
+            await asyncio.sleep(3600)
+    mi, w = True, 90
+    while True:
+        bot = TicketBotV5(mi)
+        reg_cmds(bot)
+        try:
+            await bot.start(TOKEN)
+            break
+        except discord.PrivilegedIntentsRequired:
+            print("⚠️ Enable Message Content Intent in Discord Developer Portal for full transcripts!")
+            await bot.close()
+            mi = False
+        except discord.HTTPException as e:
+            await bot.close()
+            if e.status == 429:
+                BOT_STATUS = f"429 wait {w}s"
+    
