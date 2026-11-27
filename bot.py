@@ -1418,4 +1418,16 @@ async def main():
             await bot.close()
             if e.status == 429:
                 BOT_STATUS = f"429 wait {w}s"
+                await asyncio.sleep(w)
+                w = min(w + 60, 300)
+            else:
+                await asyncio.sleep(60)
+        except Exception as e:
+            await bot.close()
+            BOT_STATUS = f"Retry ({type(e).__name__})"
+            await asyncio.sleep(60)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
     
