@@ -1,76 +1,151 @@
 # =====================================================================
-# PART 1 OF 2 — PASTE THIS FIRST AT LINE 1 OF YOUR GITHUB FILE
-# CHICAGO CROSSFIRE — 24/7 TICKET & TRANSCRIPT BOT (V2 MOBILE-READY)
+# CHICAGO CROSSFIRE — TICKET BOT V5 (SUPER ADVANCED EDITION)
+# Keeps your exact familiar buttons + adds:
+#   • Development Application button (Separate In-Game / Bot / Creative forms)
+#   • Live Roblox API Account, Age & Ban Verification inside tickets
+#   • Dual Transcripts: Dark-Mode Discord HTML + Plain TXT (DM + Staff Archive)
+#   • Confidential Staff-Only Internal Notes (archived ONLY in Staff Logs!)
+#   • Instant Private Support / Dev Interview Voice Rooms (auto-deleted on close)
+#   • Post-Ticket 5-Star Rating System in DMs + Staff Analytics & Leaderboard
+#   • Live Queue & Estimated Wait Time + Anti-Spam Cooldown & Ticket Blacklist
+#   • Smart On-Call Routing, One-Tap Staff Tools & Macros, Transfer & Dashboard
+#   • Auto-SLA Unclaimed Alerts + 12h Nudge + 24h Auto-Close (with Pause toggle)
 # Requirements: discord.py, aiohttp | Env Var: BOT_TOKEN
 # =====================================================================
-import asyncio, datetime, io, json, os, re, time, aiohttp
+import asyncio
+import datetime
+import html
+import io
+import json
+import os
+import re
+import time
+import aiohttp
 from aiohttp import web
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'")
-CFG_FILE = "chicago_ticket_cfg.json"
-START, STATUS = time.time(), "Starting..."
+DB_FILE = "chicago_tickets_v5.json"
+START_TIME, BOT_STATUS = time.time(), "Starting..."
 
-# 6 Chicago Crossfire Ticket Categories: (Title, Prefix, Emoji, Color, Welcome, Subject Label)
+# Anti-spam cooldown tracker: {(guild_id, user_id): last_open_timestamp}
+OPEN_COOLDOWN: dict[tuple[int, int], float] = {}
+
+# Exact 6 Original Ticket Categories: key -> (Title, Prefix, Emoji, Color, Welcome, SubjectLabel)
 CATEGORIES = {
     "support": ("General Support", "support", "💬", discord.Color.blurple(), "Describe your question and our staff will assist shortly.", "Question / Topic"),
-    "report": ("Report Player / Exploiter", "report", "🚨", discord.Color.red(), "Attach video clips, screenshots, or proof of the rulebreaker.", "Reported Roblox Username"),
+    "report": ("Report Player / Exploiter", "report", "🚨", discord.Color.red(), "Attach uncropped video clips (30s+), screenshots, or proof of the rulebreaker.", "Reported Roblox Username"),
     "appeal": ("Ban / Mute Appeal", "appeal", "⚖️", discord.Color.gold(), "Explain why you were punished and why it should be lifted.", "Punishment Type"),
-    "bug": ("Bug & Glitch Report", "bug", "🐛", discord.Color.orange(), "Share steps to reproduce the bug, location, and clips.", "Where did the bug happen?"),
-    "shop": ("Gamepass / Shop Issue", "shop", "💳", discord.Color.purple(), "Share the item name and a screenshot of your Roblox receipt.", "Gamepass / Item Name"),
+    "bug": ("Bug & Glitch Report", "bug", "🐛", discord.Color.orange(), "Share your device (Mobile/PC), steps to reproduce the bug, location, and clips.", "Where did the bug happen?"),
+    "shop": ("Gamepass / Shop Issue", "shop", "💳", discord.Color.purple(), "Share the item name and a screenshot of your Roblox purchase receipt.", "Gamepass / Item Name"),
     "faction": ("Faction / PD / Partner", "faction", "🤝", discord.Color.green(), "Share your faction/PD details or partnership proposal.", "Faction / PD / Server Name"),
 }
 
+DEFAULT_MACROS = {
+    "video_proof": "🎥 **Evidence Required:** Please share an uncropped video clip (20–30s+ showing context and usernames) so staff can investigate fairly.",
+    "receipt": "💳 **Receipt Needed:** Please send a screenshot of your **Roblox Transactions ➔ Purchases** page showing the item name and date (never share your password!).",
+    "bloxlink": "🔗 **Bloxlink Fix:** Run `/verify` in commands, link your Roblox account, then run `/update` to sync your roles.",
+    "inactivity": "⏳ **Inactivity Check:** Do you still need help? If there is no reply within **12 hours**, this ticket will auto-close and DM your transcript.",
+    "dev_test": "🧪 **Dev Test Rules:** Complete the assigned test task using 100% original work (no free models/stolen code) and submit your showcase or file here.",
+}
 
-def load_cfg() -> dict:
-    """Loads saved guild ticket configuration from disk."""
+
+# =====================================================================
+# 1. PERSISTENT DATABASE & PERMISSION HELPERS
+# =====================================================================
+def load_db() -> dict:
     try:
-        return json.load(open(CFG_FILE, encoding="utf-8")) if os.path.exists(CFG_FILE) else {}
+        return json.load(open(DB_FILE, encoding="utf-8")) if os.path.exists(DB_FILE) else {}
     except Exception:
         return {}
 
 
-def save_cfg() -> None:
-    """Saves guild ticket configuration to disk."""
+def save_db() -> None:
     try:
-        json.dump(CFG, open(CFG_FILE, "w", encoding="utf-8"), indent=2)
+        json.dump(DB, open(DB_FILE, "w", encoding="utf-8"), indent=2)
     except Exception:
         pass
 
 
-CFG = load_cfg()
+DB = load_db()
 
 
 def gcfg(gid: int) -> dict:
-    return CFG.get(str(gid), {})
+    return DB.setdefault(
+        str(gid),
+        {
+            "staff_role": 0,
+            "hc_role": 0,
+            "dev_lead_role": 0,
+            "ingame_dev_role": 0,
+            "bot_dev_role": 0,
+            "cat_id": 0,
+            "dev_cat_id": 0,
+            "log_ch": 0,
+            "sla_mins": 15,
+            "inactive_hrs": 12,
+            "max_open": 2,
+            "counter": 0,
+            "oncall": [],
+            "blacklist": {},
+            "macros": dict(DEFAULT_MACROS),
+            "staff_stats": {},
+            "open_tickets": {},
+        },
+    )
+
+
+def get_staff_stat(gid: int, uid: int) -> dict:
+    return gcfg(gid)["staff_stats"].setdefault(
+        str(uid), {"claimed": 0, "closed": 0, "resp_sum": 0.0, "resp_cnt": 0, "stars_sum": 0, "stars_cnt": 0}
+    )
+
+
+def get_avg_wait_text(gid: int) -> str:
+    stats = gcfg(gid)["staff_stats"].values()
+    total_s = sum(s.get("resp_sum", 0.0) for s in stats)
+    total_c = sum(s.get("resp_cnt", 0) for s in stats)
+    if not total_c:
+        return "~3 mins"
+    avg = int(total_s / total_c)
+    return f"~{avg}s" if avg < 60 else f"~{max(1, avg // 60)}m"
 
 
 def is_staff(m: discord.Member) -> bool:
-    """Checks if a user is Admin, Channel Manager, Staff, or High Command."""
     if not isinstance(m, discord.Member):
         return False
     if m.guild_permissions.administrator or m.guild_permissions.manage_channels:
         return True
     c = gcfg(m.guild.id)
-    rids = {c.get("staff_role", 0), c.get("hc_role", 0)}
-    return any(r.id in rids and r.id != 0 for r in m.roles)
+    rids = {c["staff_role"], c["hc_role"], c["dev_lead_role"]} - {0}
+    return any(r.id in rids for r in m.roles)
 
 
-# --- 1. 24/7 RENDER KEEP-ALIVE WEB SERVER ---
+def is_dev_reviewer(m: discord.Member) -> bool:
+    if not isinstance(m, discord.Member):
+        return False
+    if m.guild_permissions.administrator:
+        return True
+    c = gcfg(m.guild.id)
+    rids = {c["dev_lead_role"], c["hc_role"]} - {0}
+    return any(r.id in rids for r in m.roles) if rids else is_staff(m)
+
+
+# =====================================================================
+# 2. 24/7 KEEP-ALIVE WEB SERVER & LIVE ROBLOX ACCOUNT VERIFIER
+# =====================================================================
 async def run_web():
-    """Binds to Render's PORT and serves /health for cron-job.org pings."""
     app = web.Application()
-    health = lambda r: web.Response(text=f"Chicago Crossfire Tickets V2 | Up:{int((time.time()-START)//60)}m | {STATUS}")
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    r = web.AppRunner(app)
-    await r.setup()
-    await web.TCPSite(r, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
+    fn = lambda r: web.Response(text=f"Chicago Crossfire Tickets V5 | Up:{int((time.time()-START_TIME)//60)}m | {BOT_STATUS}")
+    app.router.add_get("/", fn)
+    app.router.add_get("/health", fn)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
 
 
 async def self_ping():
-    """Backup keep-alive ping loop."""
     await asyncio.sleep(25)
     url = os.environ.get("RENDER_EXTERNAL_URL") or f"http://127.0.0.1:{os.environ.get('PORT', 10000)}/"
     async with aiohttp.ClientSession() as s:
@@ -83,385 +158,279 @@ async def self_ping():
             await asyncio.sleep(240)
 
 
-# --- 2. TRANSCRIPT GENERATOR & CLOSE HANDLER ---
-async def make_transcript(ch: discord.TextChannel, closer: discord.Member, reason: str) -> tuple[bytes, int]:
-    """Exports every message, embed summary, and attachment URL into a .txt transcript."""
+async def lookup_roblox_user(username: str) -> str:
+    """Queries Roblox's public Users API to verify profile, User ID, account age, and ban status."""
+    clean = re.sub(r"[^A-Za-z0-9_]", "", (username or "").strip().split()[0])[:25]
+    if len(clean) < 3:
+        return "⚠️ *Could not parse Roblox username*"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                "https://users.roblox.com/v1/usernames/users",
+                json={"usernames": [clean], "excludeBannedUsers": False},
+                timeout=5,
+            ) as r:
+                if r.status != 200:
+                    return f"`{clean}` *(Roblox API unavailable)*"
+                data = (await r.json()).get("data", [])
+                if not data:
+                    return f"❌ `{clean}` — **Not Found on Roblox** *(Possible typo/fake)*"
+                u = data[0]
+                uid = u["id"]
+                async with s.get(f"https://users.roblox.com/v1/users/{uid}", timeout=5) as r2:
+                    age_str, ban_str = "Unknown", ""
+                    if r2.status == 200:
+                        d2 = await r2.json()
+                        created = d2.get("created", "")
+                        if created:
+                            dt = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+                            days = (datetime.datetime.now(datetime.timezone.utc) - dt).days
+                            age_str = f"{days}d old" + (" ⚠️ NEW ALT" if days < 30 else "")
+                        if d2.get("isBanned"):
+                            ban_str = " • ⛔ **ROBLOX BANNED**"
+                    return f"✅ **[{u['name']}](https://www.roblox.com/users/{uid}/profile)** (ID: `{uid}` • {age_str}{ban_str})"
+    except Exception:
+        return f"`{clean}` *(Lookup timed out)*"
+
+
+# =====================================================================
+# 3. DUAL TRANSCRIPTS (HTML + TXT, WITH CONFIDENTIAL STAFF NOTES) & CLOSER
+# =====================================================================
+async def build_transcripts(
+    ch: discord.TextChannel,
+    closer_name: str,
+    closer_id: int,
+    reason: str,
+    internal_notes: list[str],
+) -> tuple[bytes, bytes, bytes, bytes, int]:
+    """Builds Player transcripts (clean) and Staff Archive transcripts (includes internal staff notes)."""
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [
-        "==========================================================",
-        "        CHICAGO CROSSFIRE — OFFICIAL TICKET TRANSCRIPT    ",
-        "==========================================================",
-        f"Server    : {ch.guild.name}",
+    header = [
+        "==============================================================",
+        f"     {ch.guild.name.upper()} — TICKET V5 OFFICIAL TRANSCRIPT",
+        "==============================================================",
         f"Channel   : #{ch.name} ({ch.id})",
-        f"Closed By : {closer} ({closer.id})",
+        f"Closed By : {closer_name} ({closer_id})",
         f"Reason    : {reason}",
         f"Closed At : {now}",
-        "==========================================================\n",
+        "==============================================================\n",
     ]
+    txt_lines = list(header)
+    html_msgs = []
     count = 0
+
     async for m in ch.history(limit=None, oldest_first=True):
         count += 1
-        ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
         tag = " [BOT]" if m.author.bot else ""
-        lines.append(f"[{ts}] {m.author.display_name} (@{m.author.name}){tag}:")
+        txt_lines.append(f"[{ts}] {m.author.display_name} (@{m.author.name}){tag}:")
         if m.content:
-            lines.append(f"  {m.content}")
+            txt_lines.append(f"  {m.content}")
         for e in m.embeds:
             if e.title:
-                lines.append(f"  [Embed] {e.title}")
+                txt_lines.append(f"  [Embed] {e.title}")
             for f in e.fields:
-                lines.append(f"  • {f.name}: {f.value}")
+                txt_lines.append(f"  • {f.name}: {f.value}")
         for a in m.attachments:
-            lines.append(f"  [File] {a.filename} -> {a.url}")
-        lines.append("")
-    return "\n".join(lines).encode("utf-8"), count
+            txt_lines.append(f"  [Attachment] {a.filename} -> {a.url}")
+        txt_lines.append("")
+
+        esc_name = html.escape(m.author.display_name)
+        bot_badge = '<span class="bot">BOT</span>' if m.author.bot else ""
+        esc_body = html.escape(m.content or "").replace("\n", "<br>")
+        emb_html = "".join(
+            f"<div class='emb'><div class='et'>{html.escape(e.title or '')}</div>"
+            f"<div class='ed'>{html.escape(e.description or '')[:500]}</div>"
+            + "".join(f"<div class='ef'><b>{html.escape(f.name)}</b>: {html.escape(str(f.value))}</div>" for f in e.fields)
+            + "</div>"
+            for e in m.embeds
+        )
+        att_html = "".join(
+            f"<div class='att'>📎 <a href='{html.escape(a.url)}' target='_blank'>{html.escape(a.filename)}</a></div>"
+            for a in m.attachments
+        )
+        av = html.escape(m.author.display_avatar.url)
+        html_msgs.append(
+            f"<div class='msg'><img class='av' src='{av}'/><div>"
+            f"<div class='hdr'><b>{esc_name}</b>{bot_badge}<span class='ts'>{ts}</span></div>"
+            f"<div class='txt'>{esc_body}</div>{emb_html}{att_html}</div></div>"
+        )
+
+    def wrap_html(extra_block: str = "") -> bytes:
+        doc = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Transcript #{html.escape(ch.name)}</title>
+<style>
+body{{background:#1e1f22;color:#dbdee1;font-family:Segoe UI,Arial,sans-serif;margin:0;padding:20px;}}
+.top{{background:#2b2d31;padding:16px;border-radius:10px;border-left:4px solid #dc3545;margin-bottom:18px;}}
+.notes{{background:#35291e;padding:14px;border-radius:8px;border-left:4px solid #f0b232;margin-bottom:16px;}}
+.msg{{display:flex;gap:12px;padding:10px;border-radius:8px;margin-bottom:6px;background:#2b2d31;}}
+.av{{width:40px;height:40px;border-radius:50%;object-fit:cover;}}
+.hdr{{font-size:14px;margin-bottom:4px;}}
+.ts{{color:#949ba4;font-size:11px;margin-left:8px;}}
+.bot{{background:#5865f2;color:#fff;font-size:10px;padding:2px 5px;border-radius:4px;margin-left:6px;}}
+.txt{{font-size:14px;line-height:1.45;word-break:break-word;}}
+.emb{{background:#1e1f22;border-left:3px solid #5865f2;padding:8px 10px;margin-top:6px;border-radius:4px;font-size:13px;}}
+.et{{font-weight:700;margin-bottom:4px;}} .ef{{margin-top:3px;}}
+.att a{{color:#00a8fc;text-decoration:none;font-size:13px;}}
+</style></head><body>
+<div class="top"><h2>📄 {html.escape(ch.guild.name)} — #{html.escape(ch.name)}</h2>
+<div><b>Closed By:</b> {html.escape(closer_name)} | <b>Messages:</b> {count} | <b>At:</b> {now}</div>
+<div><b>Reason:</b> {html.escape(reason)}</div></div>
+{extra_block}{"".join(html_msgs)}</body></html>"""
+        return doc.encode("utf-8")
+
+    player_txt = "\n".join(txt_lines).encode("utf-8")
+    player_html = wrap_html("")
+
+    if internal_notes:
+        staff_txt_lines = list(txt_lines) + ["\n=== CONFIDENTIAL INTERNAL STAFF NOTES ==="] + [f"• {n}" for n in internal_notes]
+        notes_html = "<div class='notes'><h3>🔒 Confidential Internal Staff Notes</h3>" + "".join(
+            f"<div>• {html.escape(n)}</div>" for n in internal_notes
+        ) + "</div>"
+        staff_txt = "\n".join(staff_txt_lines).encode("utf-8")
+        staff_html = wrap_html(notes_html)
+    else:
+        staff_txt, staff_html = player_txt, player_html
+
+    return player_html, player_txt, staff_html, staff_txt, count
 
 
-async def close_ticket(i: discord.Interaction, reason: str = "Resolved by staff") -> None:
-    """DMs the transcript to the opener, archives to staff logs, and deletes the ticket."""
-    ch, g = i.channel, i.guild
+async def finalize_close_ticket(
+    bot: commands.Bot,
+    ch: discord.TextChannel,
+    closer,
+    reason: str = "Resolved by staff",
+) -> None:
+    """Core ticket closer: cleans up linked VC, DMs HTML+TXT & 5-Star Rating, archives Staff Log, deletes channel."""
+    g = ch.guild
     topic = ch.topic or ""
-    if not topic.startswith("CCTicket |"):
-        return await i.response.send_message("❌ Use this inside an active Chicago Crossfire ticket channel.", ephemeral=True)
+    c = gcfg(g.id)
+    tinfo = c["open_tickets"].pop(str(ch.id), {})
 
-    await i.response.send_message(f"📄 Generating transcript & DMing the player... Closing in **5s**.\n> **Reason:** {reason}")
     uid_m = re.search(r"UserID:(\d+)", topic)
-    typ_m = re.search(r"Type:([a-z]+)", topic)
-    opener_id = int(uid_m.group(1)) if uid_m else None
-    t_title = CATEGORIES.get(typ_m.group(1) if typ_m else "support", CATEGORIES["support"])[0]
+    typ_m = re.search(r"Type:([a-z0-9_]+)", topic)
+    opener_id = int(uid_m.group(1)) if uid_m else tinfo.get("opener_id")
+    t_key = typ_m.group(1) if typ_m else tinfo.get("type", "support")
+    claimer_id = tinfo.get("claimer_id") or closer.id
+    notes = tinfo.get("notes", [])
 
-    raw, msg_n = await make_transcript(ch, i.user, reason)
-    fname = f"transcript-{ch.name}-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d-%H%M')}.txt"
-
-    # 1. DM Transcript to Ticket Opener (safe lookup if user left server)
-    dm_note = "⚠️ Player not found"
-    if opener_id:
-        user = g.get_member(opener_id)
-        if not user:
+    # Clean up linked Private Voice Room if one was created
+    vc_id = tinfo.get("vc_id")
+    if vc_id:
+        vc = g.get_channel(vc_id)
+        if vc:
             try:
-                user = await i.client.fetch_user(opener_id)
+                await vc.delete(reason=f"Linked ticket #{ch.name} closed")
             except Exception:
-                user = None
-        if user:
+                pass
+
+    if not getattr(closer, "bot", False):
+        st = get_staff_stat(g.id, closer.id)
+        st["closed"] += 1
+    save_db()
+
+    p_html, p_txt, s_html, s_txt, msg_n = await build_transcripts(ch, str(closer), closer.id, reason, notes)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M")
+    h_name, t_name = f"transcript-{ch.name}-{stamp}.html", f"transcript-{ch.name}-{stamp}.txt"
+
+    # 1. DM Transcript + 5-Star Rating Buttons to Ticket Opener
+    dm_note = "⚠️ Opener not found"
+    if opener_id:
+        usr = g.get_member(opener_id)
+        if not usr:
+            try:
+                usr = await bot.fetch_user(opener_id)
+            except Exception:
+                usr = None
+        if usr:
             dm_emb = discord.Embed(
                 title=f"📄 {g.name} — Ticket Transcript",
-                description=f"Your **`{t_title}`** ticket (`#{ch.name}`) has been closed. Your full chat transcript is attached below.",
+                description=(
+                    f"Your ticket **`#{ch.name}`** (`{t_key}`) has been closed.\n"
+                    f"Open the **`.html`** file for a Discord-styled view or read the **`.txt`** file anytime!\n\n"
+                    f"⭐ **Rate your support experience below (1–5 Stars):**"
+                ),
                 color=discord.Color.from_rgb(220, 53, 69),
+                timestamp=discord.utils.utcnow(),
             )
-            dm_emb.add_field(name="🛡️ Closed By", value=i.user.display_name, inline=True)
+            dm_emb.add_field(name="🛡️ Handled By", value=f"<@{claimer_id}>", inline=True)
             dm_emb.add_field(name="💬 Messages", value=f"`{msg_n}`", inline=True)
             dm_emb.add_field(name="📝 Reason", value=reason[:400], inline=False)
-            dm_emb.set_footer(text="Chicago Crossfire Support System")
+            dm_emb.set_footer(text=f"GuildID:{g.id} | StaffID:{claimer_id} | Ticket:{ch.name}")
             try:
-                await user.send(embed=dm_emb, file=discord.File(io.BytesIO(raw), filename=fname))
-                dm_note = "✅ Delivered to Player DMs"
+                await usr.send(
+                    embed=dm_emb,
+                    files=[discord.File(io.BytesIO(p_html), filename=h_name), discord.File(io.BytesIO(p_txt), filename=t_name)],
+                    view=StarRatingView(),
+                )
+                dm_note = "✅ Delivered + 5⭐ Prompt"
             except discord.Forbidden:
-                dm_note = "⚠️ Player has DMs disabled"
+                dm_note = "⚠️ User DMs Disabled"
             except Exception as e:
-                dm_note = f"⚠️ Failed ({type(e).__name__})"
+                dm_note = f"⚠️ DM Error ({type(e).__name__})"
 
-    # 2. Archive Copy in Staff Transcript Log Channel
-    log_ch = g.get_channel(gcfg(g.id).get("log_ch", 0))
+    # 2. Archive Full Copy (including Confidential Staff Notes) in Staff Log Channel
+    log_ch = g.get_channel(c["log_ch"])
     if log_ch:
         log_emb = discord.Embed(
             title=f"📁 Ticket Closed — #{ch.name}",
             description=(
-                f"🎫 **Category:** `{t_title}`\n"
-                f"👤 **Opener:** {f'<@{opener_id}>' if opener_id else 'Unknown'}\n"
-                f"🛡️ **Closed By:** {i.user.mention}\n"
-                f"💬 **Messages:** `{msg_n}` • 📬 **DM:** {dm_note}\n"
+                f"🎫 **Type:** `{t_key}` • 👤 **Opener:** {f'<@{opener_id}>' if opener_id else 'Unknown'}\n"
+                f"🙋‍♂️ **Claimed By:** <@{claimer_id}> • 🔒 **Closed By:** {closer.mention}\n"
+                f"💬 **Messages:** `{msg_n}` • 🔒 **Staff Notes:** `{len(notes)}` • 📬 **DM:** {dm_note}\n"
                 f"📝 **Reason:** {reason[:400]}"
             ),
             color=discord.Color.dark_grey(),
             timestamp=discord.utils.utcnow(),
         )
         try:
-            await log_ch.send(embed=log_emb, file=discord.File(io.BytesIO(raw), filename=fname))
+            await log_ch.send(
+                embed=log_emb,
+                files=[discord.File(io.BytesIO(s_html), filename=h_name), discord.File(io.BytesIO(s_txt), filename=t_name)],
+            )
         except Exception:
             pass
 
     await asyncio.sleep(5)
     try:
-        await ch.delete(reason=f"Closed by {i.user}: {reason}")
+        await ch.delete(reason=f"Closed by {closer}: {reason}")
     except Exception:
         pass
 
 
-# --- 3. MODALS ---
-class IntakeModal(discord.ui.Modal):
-    """Popup form shown when a player opens any Chicago Crossfire ticket."""
-
-    def __init__(self, key: str):
-        title, _, emoji, _, _, subj = CATEGORIES[key]
-        super().__init__(title=f"{emoji} {title}"[:45])
-        self.key = key
-        self.rblx = discord.ui.TextInput(label="Your Roblox Username", placeholder="Exact Roblox username...", required=True, max_length=50)
-        self.subj = discord.ui.TextInput(label=subj[:45], required=True, max_length=120)
-        self.info = discord.ui.TextInput(label="Full Details / Proof Links", style=discord.TextStyle.paragraph, required=True, max_length=900)
-        for item in (self.rblx, self.subj, self.info):
-            self.add_item(item)
-
-    async def on_submit(self, i: discord.Interaction):
-        await i.response.defer(ephemeral=True)
-        g, u = i.guild, i.user
-        title, pfx, emoji, col, tip, subj = CATEGORIES[self.key]
-
-        for ch in g.text_channels:
-            if ch.topic and f"UserID:{u.id}" in ch.topic and f"Type:{self.key}" in ch.topic:
-                return await i.followup.send(f"⚠️ You already have an open **{title}** ticket: {ch.mention}", ephemeral=True)
-
-        c = gcfg(g.id)
-        s_role = g.get_role(c.get("staff_role", 0))
-        hc_role = g.get_role(c.get("hc_role", 0))
-        cat = g.get_channel(c.get("cat_id", 0))
-        if not isinstance(cat, discord.CategoryChannel):
-            cat = None
-
-        ow = {
-            g.default_role: discord.PermissionOverwrite(view_channel=False),
-            u: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True),
-            g.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True, attach_files=True, embed_links=True),
-        }
-        pings = [u.mention]
-        for role in (s_role, hc_role):
-            if role:
-                ow[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True)
-        if s_role:
-            pings.append(s_role.mention)
-
-        safe = re.sub(r"[^a-z0-9-]", "", u.name.lower())[:16] or "player"
-        try:
-            tch = await g.create_text_channel(name=f"{pfx}-{safe}", category=cat, overwrites=ow, topic=f"CCTicket | Type:{self.key} | UserID:{u.id}")
-        except discord.Forbidden:
-            return await i.followup.send("❌ Missing **Manage Channels** permission! Contact an Admin.", ephemeral=True)
-
-        emb = discord.Embed(title=f"{emoji} Chicago Crossfire — {title}", description=f"Welcome {u.mention}! {tip}", color=col, timestamp=discord.utils.utcnow())
-        emb.add_field(name="🎮 Roblox Username", value=f"`{self.rblx.value}`", inline=True)
-        emb.add_field(name="🙋‍♂️ Claimed By", value="*Unclaimed*", inline=True)
-        emb.add_field(name="🚦 Priority", value="🟢 `Normal`", inline=True)
-        emb.add_field(name=f"📌 {subj}", value=self.subj.value, inline=False)
-        emb.add_field(name="📝 Details / Evidence", value=self.info.value, inline=False)
-        emb.set_footer(text="Full transcript is automatically sent to your DMs when closed")
-
-        await tch.send(content=" ".join(pings), embed=emb, view=TicketControls())
-        await i.followup.send(f"✅ Your **{title}** ticket is ready: {tch.mention}", ephemeral=True)
+async def close_ticket_interaction(i: discord.Interaction, reason: str = "Resolved by staff") -> None:
+    if not (i.channel.topic or "").startswith("CCT5 |"):
+        return await i.response.send_message("❌ Use this inside an active Ticket V5 channel.", ephemeral=True)
+    await i.response.send_message(f"📄 Generating **HTML + TXT transcripts** & DMing 5-Star Rating... Closing in **5s**.\n> **Reason:** {reason}")
+    asyncio.create_task(finalize_close_ticket(i.client, i.channel, i.user, reason))
 
 
-class CloseModal(discord.ui.Modal, title="🔒 Close Ticket & DM Transcript"):
-    reason = discord.ui.TextInput(label="Closing Reason (Sent to Player DM)", default="Issue resolved", required=True, max_length=300)
+async def spawn_ticket_voice(i: discord.Interaction) -> None:
+    """Creates a private voice room locked to the ticket opener + staff (auto-deleted on close)."""
+    g, ch = i.guild, i.channel
+    c = gcfg(g.id)
+    tinfo = c["open_tickets"].setdefault(str(ch.id), {})
+    if tinfo.get("vc_id"):
+        existing = g.get_channel(tinfo["vc_id"])
+        if existing:
+            return await i.response.send_message(f"🎙️ Voice room already active: {existing.mention}", ephemeral=True)
 
-    async def on_submit(self, i: discord.Interaction):
-        await close_ticket(i, self.reason.value)
+    m = re.search(r"UserID:(\d+)", ch.topic or "")
+    opener = g.get_member(int(m.group(1))) if m else None
+    ow = {
+        g.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
+        g.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
+    }
+    if opener:
+        ow[opener] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
+    for rid in (c["staff_role"], c["hc_role"], c["dev_lead_role"]):
+        role = g.get_role(rid)
+        if role:
+            ow[role] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True, mute_members=True)
 
-# =====================================================================
-# PART 2 OF 2 — PASTE THIS DIRECTLY BELOW PART 1 (FAR LEFT EDGE)
-# =====================================================================
-class TicketControls(discord.ui.View):
-    """Persistent Claim, Escalate & Close buttons inside every ticket channel."""
-
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Claim Ticket", style=discord.ButtonStyle.success, emoji="🙋‍♂️", custom_id="ccf:claim")
-    async def b_claim(self, i: discord.Interaction, b: discord.ui.Button):
-        if not is_staff(i.user):
-            return await i.response.send_message("❌ Staff only.", ephemeral=True)
-        b.disabled, b.style, b.label = True, discord.ButtonStyle.secondary, f"Claimed by {i.user.display_name}"[:75]
-        emb = i.message.embeds[0] if i.message.embeds else None
-        if emb and len(emb.fields) > 1:
-            emb.set_field_at(1, name="🙋‍♂️ Claimed By", value=i.user.mention, inline=True)
-            await i.response.edit_message(embed=emb, view=self)
-        else:
-            await i.response.edit_message(view=self)
-        await i.channel.send(f"✅ {i.user.mention} has claimed this ticket and will assist you now!")
-
-    @discord.ui.button(label="Escalate (Urgent)", style=discord.ButtonStyle.primary, emoji="⬆️", custom_id="ccf:esc")
-    async def b_esc(self, i: discord.Interaction, b: discord.ui.Button):
-        if not is_staff(i.user):
-            return await i.response.send_message("❌ Staff only.", ephemeral=True)
-        b.disabled, b.label = True, "Escalated 🔴"
-        emb = i.message.embeds[0] if i.message.embeds else None
-        if emb:
-            emb.color = discord.Color.dark_red()
-            if len(emb.fields) > 2:
-                emb.set_field_at(2, name="🚦 Priority", value="🔴 `URGENT / ESCALATED`", inline=True)
-            await i.response.edit_message(embed=emb, view=self)
-        else:
-            await i.response.edit_message(view=self)
-        try:
-            if not i.channel.name.startswith("urgent-"):
-                await i.channel.edit(name=f"urgent-{i.channel.name}"[:90])
-        except Exception:
-            pass
-        hc_id = gcfg(i.guild.id).get("hc_role", 0)
-        ping = f"<@&{hc_id}>" if hc_id else "**High Command**"
-        await i.channel.send(f"🚨 {ping} — Ticket escalated to **URGENT** by {i.user.mention}!")
-
-    @discord.ui.button(label="Close & DM Transcript", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="ccf:close")
-    async def b_close(self, i: discord.Interaction, b: discord.ui.Button):
-        opener = f"UserID:{i.user.id}" in (i.channel.topic or "")
-        if not (is_staff(i.user) or opener):
-            return await i.response.send_message("❌ Only staff or the ticket opener can close this.", ephemeral=True)
-        await i.response.send_modal(CloseModal())
-
-
-class TicketPanel(discord.ui.View):
-    """6-Button Chicago Crossfire Support Center Panel."""
-
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="General Support", style=discord.ButtonStyle.primary, emoji="💬", custom_id="ccfp:sup", row=0)
-    async def b1(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(IntakeModal("support"))
-
-    @discord.ui.button(label="Report Player / Exploiter", style=discord.ButtonStyle.danger, emoji="🚨", custom_id="ccfp:rep", row=0)
-    async def b2(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(IntakeModal("report"))
-
-    @discord.ui.button(label="Ban / Mute Appeal", style=discord.ButtonStyle.secondary, emoji="⚖️", custom_id="ccfp:app", row=1)
-    async def b3(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(IntakeModal("appeal"))
-
-    @discord.ui.button(label="Bug & Glitch Report", style=discord.ButtonStyle.secondary, emoji="🐛", custom_id="ccfp:bug", row=1)
-    async def b4(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(IntakeModal("bug"))
-
-    @discord.ui.button(label="Gamepass / Shop Issue", style=discord.ButtonStyle.primary, emoji="💳", custom_id="ccfp:shp", row=2)
-    async def b5(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(IntakeModal("shop"))
-
-    @discord.ui.button(label="Faction / PD / Partner", style=discord.ButtonStyle.success, emoji="🤝", custom_id="ccfp:fac", row=2)
-    async def b6(self, i: discord.Interaction, b: discord.ui.Button): await i.response.send_modal(IntakeModal("faction"))
-
-
-# --- 4. BOT CORE & SLASH COMMANDS ---
-class ChicagoBot(commands.Bot):
-    def __init__(self, mi: bool = True):
-        it = discord.Intents.default()
-        it.message_content = mi
-        super().__init__(command_prefix="!", intents=it, help_command=None)
-        self._synced = False
-
-    async def setup_hook(self):
-        self.add_view(TicketPanel())
-        self.add_view(TicketControls())
-        if not self._synced:
-            try:
-                await self.tree.sync()
-                self._synced = True
-            except Exception as e:
-                print(f"Sync notice: {e}")
-
-    async def on_ready(self):
-        global STATUS
-        STATUS = f"ONLINE as {self.user}"
-        print(f"✅ Chicago Crossfire Ticket Bot ONLINE as {self.user}")
-        try:
-            await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Chicago Crossfire Support 🎫"))
-        except Exception:
-            pass
-
-
-def reg_cmds(bot: ChicagoBot):
-    @bot.tree.command(name="ticket_setup", description="Set Staff Role, Ticket Category, Transcript Logs & optional High Command Role")
-    async def s_setup(i: discord.Interaction, staff_role: discord.Role, ticket_category: discord.CategoryChannel, transcript_log_channel: discord.TextChannel, high_command_role: discord.Role = None):
-        if not i.user.guild_permissions.administrator:
-            return await i.response.send_message("❌ Administrators only.", ephemeral=True)
-        CFG[str(i.guild.id)] = {
-            "staff_role": staff_role.id,
-            "hc_role": high_command_role.id if high_command_role else 0,
-            "cat_id": ticket_category.id,
-            "log_ch": transcript_log_channel.id,
-        }
-        save_cfg()
-        await i.response.send_message(
-            f"✅ **Chicago Crossfire Tickets Configured!**\n"
-            f"🛡️ Staff: {staff_role.mention} | 👑 Escalation Role: {high_command_role.mention if high_command_role else '*None*'}\n"
-            f"📁 Category: `{ticket_category.name}` | 📜 Logs: {transcript_log_channel.mention}\n"
-            f"👉 Next: Run **`/ticket_panel`** in your support channel!",
-            ephemeral=True,
-        )
-
-    @bot.tree.command(name="ticket_panel", description="Post the 6-button Chicago Crossfire Support & Ticket Panel")
-    async def s_panel(i: discord.Interaction):
-        if not is_staff(i.user):
-            return await i.response.send_message("❌ Staff only.", ephemeral=True)
-        emb = discord.Embed(
-            title="🔥 CHICAGO CROSSFIRE — SUPPORT & TICKET CENTER",
-            description=(
-                "Need help in **Chicago Crossfire**? Pick a category below to open a private ticket with our team!\n\n"
-                "💬 **General Support** — Questions & gameplay assistance\n"
-                "🚨 **Report Player / Exploiter** — Report cheaters, RDM, or rulebreakers\n"
-                "⚖️ **Ban / Mute Appeal** — Appeal an in-game or Discord punishment\n"
-                "🐛 **Bug & Glitch Report** — Report map glitches, weapon bugs, or crashes\n"
-                "💳 **Gamepass / Shop Issue** — Missing gamepasses or Roblox store issues\n"
-                "🤝 **Faction / PD / Partner** — Faction approvals, PD & partnerships\n\n"
-                "📄 *Every closed ticket automatically DMs you a full transcript!*"
-            ),
-            color=discord.Color.from_rgb(220, 53, 69),
-        )
-        emb.set_footer(text="Chicago Crossfire Support • Do not open troll tickets")
-        await i.response.send_message(embed=emb, view=TicketPanel())
-
-    @bot.tree.command(name="add_user", description="Add another player to this ticket")
-    async def s_add(i: discord.Interaction, member: discord.Member):
-        if not is_staff(i.user) or not (i.channel.topic or "").startswith("CCTicket |"):
-            return await i.response.send_message("❌ Staff inside a ticket channel only.", ephemeral=True)
-        await i.channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
-        await i.response.send_message(f"➕ Added {member.mention} to this ticket.")
-
-    @bot.tree.command(name="remove_user", description="Remove a player from this ticket")
-    async def s_rem(i: discord.Interaction, member: discord.Member):
-        if not is_staff(i.user) or not (i.channel.topic or "").startswith("CCTicket |"):
-            return await i.response.send_message("❌ Staff inside a ticket channel only.", ephemeral=True)
-        await i.channel.set_permissions(member, overwrite=None)
-        await i.response.send_message(f"➖ Removed {member.mention} from this ticket.")
-
-    @bot.tree.command(name="rename_ticket", description="Rename this ticket channel cleanly")
-    async def s_ren(i: discord.Interaction, new_name: str):
-        if not is_staff(i.user) or not (i.channel.topic or "").startswith("CCTicket |"):
-            return await i.response.send_message("❌ Staff inside a ticket channel only.", ephemeral=True)
-        clean = re.sub(r"[^a-z0-9-]", "-", new_name.lower().strip()).strip("-")[:60] or "ticket"
-        await i.channel.edit(name=clean)
-        await i.response.send_message(f"✏️ Renamed ticket channel to **`#{clean}`**.")
-
-    @bot.tree.command(name="close", description="Close this ticket and DM the full transcript to the player")
-    async def s_cls(i: discord.Interaction, reason: str = "Resolved by staff"):
-        if not is_staff(i.user):
-            return await i.response.send_message("❌ Staff only.", ephemeral=True)
-        await close_ticket(i, reason)
-
-
-# --- 5. 24/7 ENTRYPOINT WITH 429 AUTO-RETRY ---
-async def main():
-    global STATUS
-    await run_web()
-    asyncio.create_task(self_ping())
-    if not TOKEN:
-        STATUS = "MISSING BOT_TOKEN"
-        print("❌ Add BOT_TOKEN in Render Environment Variables!")
-        while True:
-            await asyncio.sleep(3600)
-    mi, w = True, 90
-    while True:
-        bot = ChicagoBot(mi)
-        reg_cmds(bot)
-        try:
-            await bot.start(TOKEN)
-            break
-        except discord.PrivilegedIntentsRequired:
-            await bot.close()
-            mi = False
-        except discord.HTTPException as e:
-            await bot.close()
-            if e.status == 429:
-                STATUS = f"429 wait {w}s"
-                await asyncio.sleep(w)
-                w = min(w + 60, 300)
-            else:
-                await asyncio.sleep(60)
-        except Exception as e:
-            await bot.close()
-            STATUS = f"Retry ({type(e).__name__})"
-            await asyncio.sleep(60)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-    
+    try:
+        vc = await g.create_voice_channel(name=f"🎙️-{ch.name}"[:80], category=ch.category, overwrites=ow)
+        tinfo["vc_id"] = vc.id
+        save_db()
+        await i.response.send_message(f"🎙️ **Private Support / Interview Voice Room created:** {vc.mention}\n*(Automatically deleted when this ticket closes!)*")
+except 
