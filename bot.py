@@ -433,7 +433,7 @@ async def spawn_ticket_voice(i: discord.Interaction) -> None:
         tinfo["vc_id"] = vc.id
         save_db()
         await i.response.send_message(f"🎙️ **Private Support / Interview Voice Room created:** {vc.mention}\n*(Automatically deleted when this ticket closes!)*")
-except discord.Forbidden:
+    except discord.Forbidden:
         await i.response.send_message("❌ Bot needs **Manage Channels** permission to create a voice room!", ephemeral=True)
 
 
